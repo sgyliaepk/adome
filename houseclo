@@ -1,0 +1,634 @@
+local Players = game:GetService("Players")
+local loadModule = require(game:GetService("ReplicatedStorage"):WaitForChild("Fsys")).load
+local store = loadModule("ClientStore").store
+local catalog = loadModule("FurnitureDB")
+local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+
+local function encode(value, active)
+    local kind = typeof(value)
+    if kind == "string" then return string.format("%q", value) end
+    if kind == "boolean" then return tostring(value) end
+    if kind == "number" then
+        assert(value == value and math.abs(value) < math.huge, "Invalid number")
+        return string.format("%.17g", value)
+    end
+    if kind == "Vector3" or kind == "Color3" or kind == "CFrame" then
+        local components
+        if kind == "CFrame" then
+            components = {value:GetComponents()}
+        elseif kind == "Color3" then
+            components = {value.R, value.G, value.B}
+        else
+            components = {value.X, value.Y, value.Z}
+        end
+        for index, component in ipairs(components) do
+            components[index] = encode(component, active)
+        end
+        return kind .. ".new(" .. table.concat(components, ",") .. ")"
+    end
+    assert(kind == "table", "Unsupported layout field type: " .. kind)
+    assert(not active[value], "Layout contains a circular reference")
+    active[value] = true
+    local fields = {}
+    for key, field in pairs(value) do
+        if typeof(field) ~= "Instance" then
+            assert(type(key) == "number" or type(key) == "string", "Unsupported layout key")
+            table.insert(fields, "[" .. encode(key, active) .. "]=" .. encode(field, active))
+        end
+    end
+    active[value] = nil
+    table.sort(fields)
+    return "{" .. table.concat(fields, ",") .. "}"
+end
+
+local environment = getgenv()
+if environment.HouseExporterCleanup then
+    pcall(environment.HouseExporterCleanup)
+end
+
+local source = "https://raw.githubusercontent.com/Nebula-Softworks/Luna-Interface-Suite/30adb817b8f8e4acfff3841d1a4fe338ac940ddf/source.lua"
+local Luna = assert(loadstring(game:HttpGet(source)))()
+local window = Luna:CreateWindow({
+    Name = "Mari Hub",
+    Subtitle = "House Cloner",
+    LoadingEnabled = false,
+    ConfigSettings = {ConfigFolder = "Mari Hub"},
+    KeySystem = false,
+})
+
+local function createTab(name, icon)
+    return window:CreateTab({Name = name, Icon = icon, ImageSource = "Material", ShowTitle = true})
+end
+
+local tab = createTab("House Cloner", "house")
+local function notify(titleText, content)
+    Luna:Notification({Title = titleText, Content = content, Icon = "info", ImageSource = "Material"})
+end
+local scannedLayout, scannedType, loadedHouse
+local scanType = tab:CreateLabel({Text = "House type: —", Style = 1})
+local scanFurniture = tab:CreateLabel({Text = "Furniture count: —", Style = 1})
+local scanTextures = tab:CreateLabel({Text = "Textures count: —", Style = 1})
+local scanProgress = tab:CreateLabel({Text = "Scan progress: 0%", Style = 2})
+
+local texturesCatalog = loadModule("TexturesDB")
+local function showScan(house)
+    local furnitureCount, furnitureCost, unknownFurniture = 0, 0, 0
+    local textureCount, textureCost, unknownTextures = 0, 0, 0
+    for _, item in pairs(house.furniture) do
+        furnitureCount += 1
+        local entry = catalog[item.id]
+        if entry and type(entry.cost) == "number" and not entry.off_sale then
+            furnitureCost += entry.cost
+        else
+            unknownFurniture += 1
+        end
+    end
+    for _, room in pairs(house.textures or {}) do
+        for kind, id in pairs(room) do
+            textureCount += 1
+            local entry = texturesCatalog[kind] and texturesCatalog[kind][id]
+            if entry and type(entry.cost) == "number" then
+                textureCost += entry.cost
+            else
+                unknownTextures += 1
+            end
+        end
+    end
+    scanType:Set("House type: " .. house.building_type)
+    scanFurniture:Set(string.format("Furniture count: %d (%d Bucks listed, %d unpriced)", furnitureCount, furnitureCost, unknownFurniture))
+    scanTextures:Set(string.format("Textures count: %d (%d Bucks listed, %d unpriced)", textureCount, textureCost, unknownTextures))
+    scanProgress:Set("Scan progress: 100%")
+end
+
+tab:CreateSection("Main function")
+tab:CreateButton({
+    Name = "Scan house",
+    Callback = function()
+        local house = store:getState().house_interior
+        if not (house and house.building_type and type(house.furniture) == "table") then
+            notify("No house to scan", "Enter a house before scanning.")
+            return
+        end
+        local ok, layout = pcall(encode, house, {})
+        if not ok then
+            notify("Scan failed", tostring(layout))
+            return
+        end
+        scannedLayout = "return " .. layout
+        scannedType = house.building_type
+        loadedHouse = nil
+        showScan(house)
+        notify("House scanned", "Open File System to name and save this scan.")
+    end,
+})
+tab:CreateButton({
+    Name = "Sell All Furnitures",
+    Callback = function()
+        local ok, problem = pcall(function()
+            local houseClient = loadModule("HouseClient")
+            assert(houseClient.is_current_house_owner() and not houseClient.is_sandbox(),
+                "Open the furniture editor inside your own house.")
+            local house = store:getState().house_interior
+            local editor = loadModule("UIManager").apps.FurnitureSelectorApp
+            local tracker = loadModule("FurnitureModelTracker")
+            local furniture = {}
+            for id, item in pairs(house.furniture) do
+                local model = tracker.get_furniture_by_unique(id)
+                assert(model, "Wait for all the furniture to load and try again.")
+                furniture[model] = table.clone(item)
+            end
+            assert(next(furniture), "Your house has no furniture to sell.")
+            editor:deselect_all()
+            editor:select_furnitures(furniture)
+            local selection = editor:get_selected_furnitures()
+            editor:deselect_all()
+            assert(#selection > 0, "Open the furniture editor before selling.")
+            editor:remove_all_furniture(selection)
+        end)
+        if not ok then notify("Cannot open bulk sell", tostring(problem)) end
+    end,
+})
+local placementStatus = tab:CreateParagraph({Title = "Placement status", Text = "Load a house file to begin."})
+local placing = false
+local houseClient = loadModule("HouseClient")
+local prices = loadModule("new:FurnitureEntryHelper")
+local money = loadModule("ClientData")
+local router = loadModule("RouterClient")
+local placementRequested = false
+local function placeHouse()
+    if placing then return end
+    placing = true
+    local ok, result = pcall(function()
+        local sourceHouse = assert(loadedHouse, "Select a file in File System and click Load house from file first.")
+        local target = store:getState().house_interior
+        assert(target and houseClient.is_current_house_owner() and not houseClient.is_sandbox(),
+            "Enter your own house before placing.")
+        assert(target.building_type == sourceHouse.building_type,
+            "Open your own " .. sourceHouse.building_type .. " house first.")
+        assert(not next(target.furniture or {}), "Clear the destination furniture first to avoid duplicates.")
+        assert(encode(target.active_addons or {}, {}) == encode(sourceHouse.active_addons or {}, {}),
+            "Match the saved house expansions before placing.")
+
+        local requests, textures = {}, {}
+        local total = 0
+        local function addPrice(entry, id)
+            local bucks, alternate = prices.get_cost(entry)
+            assert(type(bucks) == "number" and bucks >= 0 and not alternate,
+                "No Bucks price for " .. id)
+            total += bucks
+        end
+        for _, item in pairs(sourceHouse.furniture) do
+            local entry = catalog[item.id]
+            assert(entry and entry.can_use_in_house and not entry.off_sale and not entry.gamepass
+                and not entry.buy_behavior and typeof(item.cframe) == "CFrame",
+                "Cannot purchase or place " .. tostring(item.id))
+            addPrice(entry, item.id)
+            table.insert(requests, {
+                kind = entry.kind,
+                properties = {cframe = item.cframe, scale = item.scale, colors = item.colors},
+            })
+        end
+        assert(not target.max_furniture or #requests <= target.max_furniture, "The destination furniture limit is too low.")
+        for roomId, room in pairs(sourceHouse.textures or {}) do
+            local existing = (target.textures or {})[roomId] or {}
+            for kind, id in pairs(room) do
+                if existing[kind] ~= id then
+                    local entry = texturesCatalog[kind] and texturesCatalog[kind][id]
+                    assert(entry and not entry.off_sale and not entry.gamepass, "Cannot purchase texture " .. tostring(id))
+                    addPrice(entry, id)
+                    table.insert(textures, {roomId, kind, id})
+                end
+            end
+        end
+
+        local function checkDestination()
+            local current = store:getState().house_interior
+            assert(houseClient.is_current_house_owner() and current and current.house_id == target.house_id,
+                "The destination house changed. Placement stopped.")
+            return current
+        end
+        assert((money.get("money") or 0) >= total, string.format("You need %d Bucks to place this layout.", total))
+        assert(#requests + #textures > 0, "This layout has nothing to place.")
+        local current = checkDestination()
+        assert(not next(current.furniture or {}), "The destination furniture changed. Load the file again before placing.")
+        assert((money.get("money") or 0) >= total, string.format("You need %d Bucks to place this layout.", total))
+        if #requests > 0 then
+            checkDestination()
+            local response = router.get("HousingAPI/BuyFurnitures"):InvokeServer(requests)
+            local placed = 0
+            for _, item in pairs(response and response.results or {}) do
+                if item.status == "SUCCESS" then placed += 1 end
+            end
+            assert(response and response.success and placed == #requests,
+                string.format("Furniture batch incomplete (%d/%d reported placed). Check your house before trying again.", placed, #requests))
+        end
+        for index, texture in ipairs(textures) do
+            checkDestination()
+            pcall(function() scanProgress:Set(string.format("Placement progress: texture %d/%d", index, #textures)) end)
+            router.get("HousingAPI/BuyTexture"):FireServer(table.unpack(texture))
+            local expires = os.clock() + 5
+            while true do
+                local current = checkDestination()
+                local room = (current.textures or {})[texture[1]]
+                if room and room[texture[2]] == texture[3] then break end
+                assert(os.clock() < expires, "A texture purchase was not confirmed. Check your house before trying again.")
+                task.wait(0.1)
+            end
+        end
+        pcall(function() scanProgress:Set("Placement progress: 100%") end)
+        return string.format("Confirmed %d furniture placements and %d texture changes.", #requests, #textures)
+    end)
+    placing = false
+    local title = ok and "Placement complete" or "Placement stopped"
+    local message = tostring(result)
+    pcall(function() placementStatus:Set({Title = title, Text = message}) end)
+    pcall(function() notify(title, message) end)
+    if not ok then warn("[Mari Hub] " .. message) end
+end
+
+tab:CreateButton({
+    Name = "Place house",
+    Callback = function()
+        if not placing then placementRequested = true end
+    end,
+})
+
+local refreshFiles
+local fileRefreshRequested = false
+local teleportRequested
+local teleporting = false
+local interiors = loadModule("InteriorsM")
+local function enterHouse(player)
+    if player.Parent ~= Players then
+        notify("Player unavailable", "That player has left the server.")
+        return
+    end
+    local location = interiors.get_current_location()
+    if location and location.destination_id == "housing" and location.house_owner == player then
+        notify("Already inside", "You are already in " .. player.Name .. "'s house.")
+        return
+    end
+
+    teleporting = true
+    local ok, problem = pcall(interiors.enter_smooth, "housing", "MainDoor", {house_owner = player})
+    teleporting = false
+    if not ok then
+        pcall(notify, "Could not enter house", tostring(problem))
+    end
+end
+-- Run the purchase from the script thread. The UI input callback has
+-- restricted capabilities when it calls the game modules directly.
+local placementIdentity = type(getthreadidentity) == "function" and getthreadidentity()
+local placementWorker = task.spawn(function()
+    if placementIdentity and type(setthreadidentity) == "function" then
+        setthreadidentity(placementIdentity)
+    end
+    while true do
+        if placementRequested then
+            placementRequested = false
+            placeHouse()
+        elseif teleportRequested then
+            local player = teleportRequested
+            teleportRequested = nil
+            enterHouse(player)
+        elseif fileRefreshRequested and refreshFiles then
+            fileRefreshRequested = false
+            refreshFiles()
+        end
+        task.wait(0.1)
+    end
+end)
+-- Read house tables as data. Only the three layout constructors are accepted.
+local function decode(sourceText)
+    assert(#sourceText <= 8 * 1024 * 1024, "House file is too large")
+    local position = 1
+    local function token(pattern)
+        local _, whitespaceEnd = sourceText:find("^%s*", position)
+        position = whitespaceEnd + 1
+        local first, last = sourceText:find("^" .. pattern, position)
+        if first then
+            position = last + 1
+            return sourceText:sub(first, last)
+        end
+    end
+    local function expect(pattern)
+        local value = token(pattern)
+        assert(value, "Invalid house file near byte " .. position)
+        return value
+    end
+    local constructors = {
+        ["Vector3.new"] = {Vector3.new, 3},
+        ["Color3.new"] = {Color3.new, 3},
+        ["CFrame.new"] = {CFrame.new, 12},
+    }
+    local parse
+    parse = function(depth)
+        assert(depth <= 64, "House file is nested too deeply")
+        if token("{") then
+            local value = {}
+            local index = 1
+            while not token("}") do
+                local key
+                if token("%[") then
+                    key = parse(depth + 1)
+                    expect("%]")
+                    expect("=")
+                else
+                    local name = token("[%a_][%w_]*%s*=")
+                    key = name and name:match("^[%w_]+") or index
+                    if not name then index += 1 end
+                end
+                assert(type(key) == "string" or type(key) == "number", "Invalid table key")
+                value[key] = parse(depth + 1)
+                if not token("[,;]") then
+                    expect("}")
+                    break
+                end
+            end
+            return value
+        end
+        local quote = token("[\"']")
+        if quote then
+            local first = position - 1
+            while position <= #sourceText do
+                local character = sourceText:sub(position, position)
+                position += 1
+                if character == quote then
+                    local literal = sourceText:sub(first, position - 1)
+                    return assert(loadstring("return " .. literal))()
+                end
+                if character == "\\" then position += 1 end
+            end
+            error("Unterminated string")
+        end
+        local numeric = token("[+-]?[%d%.][%d%.]*[eE]?[+-]?%d*")
+        if numeric then
+            local value = tonumber(numeric)
+            assert(value and math.abs(value) < math.huge, "Invalid number")
+            return value
+        end
+        local name = expect("[%a_][%w_%.]*")
+        if name == "true" or name == "false" then return name == "true" end
+        local constructor = assert(constructors[name], "Unsupported house field: " .. name)
+        expect("%(")
+        local arguments = {}
+        for index = 1, constructor[2] do
+            if index > 1 then expect(",") end
+            local value = tonumber(expect("[+-]?[%d%.][%d%.]*[eE]?[+-]?%d*"))
+            assert(value and math.abs(value) < math.huge, "Invalid constructor number")
+            arguments[index] = value
+        end
+        expect("%)")
+        return constructor[1](table.unpack(arguments))
+    end
+    expect("return%f[^%w_]")
+    local house = parse(0)
+    expect("$")
+    assert(type(house) == "table" and type(house.building_type) == "string"
+        and type(house.furniture) == "table", "File does not contain a house layout")
+    return house
+end
+
+local filesTab = createTab("File System", "folder")
+local folder = "Savedhouses"
+local function prepareFolder()
+    assert(type(isfolder) == "function" and type(makefolder) == "function", "Folder access unavailable")
+    if not isfolder(folder) then makefolder(folder) end
+end
+
+local query, filename, selectedFile = "", "", nil
+local filePaths = {}
+local noFile = "Choose a saved file"
+local typeOptions = {}
+local houseType = "Any house type"
+local houseTypeDropdown = filesTab:CreateDropdown({
+    Name = "Select house type",
+    Options = {houseType},
+    CurrentOption = {houseType},
+    Callback = function(options)
+        houseType = type(options) == "string" and options or "Any house type"
+    end,
+})
+filesTab:CreateSection("Open saved layout")
+filesTab:CreateInput({
+    Name = "Search File",
+    PlaceholderText = "Type file name here",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        query = string.lower(text)
+        fileRefreshRequested = true
+    end,
+})
+local fileDropdown = filesTab:CreateDropdown({
+    Name = "Select file",
+    Options = {noFile},
+    CurrentOption = {noFile},
+    Callback = function(options)
+        local name = type(options) == "string" and options
+        selectedFile = filePaths[name] and name or nil
+    end,
+})
+
+refreshFiles = function()
+    local ok, result = pcall(function()
+        prepareFolder()
+        assert(type(listfiles) == "function", "File listing unavailable")
+        local matches = {}
+        filePaths = {}
+        for _, path in ipairs(listfiles(folder)) do
+            local name = path:match("([^/\\]+)$")
+            local lower = name and name:lower()
+            if lower and (lower:match("%.luau$") or lower:match("%.lua$") or lower:match("%.lua%.txt$"))
+                and lower:find(query, 1, true) then
+                filePaths[name] = path
+                table.insert(matches, name)
+            end
+        end
+        table.sort(matches)
+        table.insert(matches, 1, noFile)
+        fileDropdown:Set({Options = matches, CurrentOption = {selectedFile and filePaths[selectedFile] and selectedFile or noFile}})
+        return #matches - 1
+    end)
+    if not ok then
+        warn("[Mari Hub] File refresh: " .. tostring(result))
+        pcall(notify, "Refresh failed", tostring(result))
+    end
+end
+
+filesTab:CreateButton({Name = "Refresh files", Callback = function() fileRefreshRequested = true end})
+local loadedDetails
+filesTab:CreateButton({
+    Name = "Load house from file",
+    Callback = function()
+        local path = selectedFile and filePaths[selectedFile]
+        if not path then
+            notify("Select a file", "Choose a saved house layout first.")
+            return
+        end
+        local ok, result = pcall(function()
+            assert(type(readfile) == "function", "File reading unavailable")
+            local house = decode(readfile(path))
+            assert(houseType == "Any house type" or houseType == house.building_type,
+                "This file contains " .. house.building_type .. ". Select that type or Any house type.")
+            showScan(house)
+            loadedHouse = house
+            local count = 0
+            for _ in pairs(house.furniture) do count += 1 end
+            return string.format("%s\n%s | %d furniture\nLoaded for inspection.", selectedFile, house.building_type, count)
+        end)
+        if ok then
+            loadedDetails:Set({Title = "Loaded layout", Text = result})
+            notify("Layout loaded", selectedFile)
+        else
+            notify("Load failed", tostring(result))
+        end
+    end,
+})
+
+filesTab:CreateSection("Save scanned house")
+filesTab:CreateInput({
+    Name = "House File Name",
+    PlaceholderText = "ex. house1",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) filename = text:match("^%s*(.-)%s*$") end,
+})
+filesTab:CreateButton({
+    Name = "Save house to file",
+    Callback = function()
+        local ok, result = pcall(function()
+            assert(scannedLayout, "Use Scan house before saving.")
+            assert(houseType == "Any house type" or houseType == scannedType, "Select the scanned house type.")
+            assert(#filename <= 64 and filename:match("^[%w][%w _%-]*$"), "Enter a file name using letters, numbers, spaces, underscores or hyphens.")
+            prepareFolder()
+            assert(type(writefile) == "function" and type(isfile) == "function", "File writing unavailable")
+            local path = folder .. "/" .. filename .. ".luau"
+            assert(not isfile(path), "That name already exists. Choose a different name.")
+            writefile(path, scannedLayout)
+            return path
+        end)
+        notify(ok and "House saved" or "Save failed", tostring(result))
+        if ok then fileRefreshRequested = true end
+    end,
+})
+loadedDetails = filesTab:CreateParagraph({Title = "Loaded layout", Text = "No house file loaded."})
+
+local houseCatalog = loadModule("HouseDB")
+for kind in pairs(houseCatalog) do
+    if type(kind) == "string" then table.insert(typeOptions, kind) end
+end
+table.sort(typeOptions)
+table.insert(typeOptions, 1, "Any house type")
+houseTypeDropdown:Set({Options = typeOptions, CurrentOption = {"Any house type"}})
+refreshFiles()
+
+local teleportTab = createTab("Teleport", "location_on")
+local selectedPlayer
+local noPlayer = "Choose a player"
+local function teleportPlayerNames(excluded)
+    local names = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= Players.LocalPlayer and player ~= excluded then
+            table.insert(names, player.Name)
+        end
+    end
+    table.sort(names)
+    table.insert(names, 1, noPlayer)
+    return names
+end
+
+local playerDropdown = teleportTab:CreateDropdown({
+    Name = "Select player",
+    Options = teleportPlayerNames(),
+    CurrentOption = {noPlayer},
+    MultipleOptions = false,
+    Callback = function(options)
+        selectedPlayer = type(options) == "string" and Players:FindFirstChild(options) or nil
+    end,
+})
+local function requestTeleport(player)
+    if placing or teleporting or teleportRequested then return end
+    if not player then
+        notify("Select a player", "Choose someone in the server first.")
+        return
+    end
+    teleportRequested = player
+end
+
+teleportTab:CreateButton({
+    Name = "Enter house",
+    Callback = function() requestTeleport(selectedPlayer) end,
+})
+teleportTab:CreateButton({
+    Name = "Return home",
+    Callback = function() requestTeleport(Players.LocalPlayer) end,
+})
+
+local function refreshPlayers(excluded)
+    local name = selectedPlayer and selectedPlayer ~= excluded and selectedPlayer.Name or noPlayer
+    playerDropdown:Set({Options = teleportPlayerNames(excluded), CurrentOption = {name}})
+end
+local playerAdded = Players.PlayerAdded:Connect(function() refreshPlayers() end)
+local playerRemoving = Players.PlayerRemoving:Connect(refreshPlayers)
+local faqTab = createTab("FAQ", "help_outline")
+faqTab:CreateParagraph({
+    Title = "Save a house",
+    Text = "1. Teleport: Select player → Enter house\n2. House Cloner: Scan house\n3. File System: House File Name → Save house to file",
+})
+faqTab:CreateParagraph({
+    Title = "Paste a house",
+    Text = "1. Teleport: Return home (empty house of the same type)\n2. File System: Select file → Load house from file\n3. House Cloner: Place house",
+})
+local function applyMariPalette()
+    local coreGui = game:GetService("CoreGui")
+    local root = type(gethui) == "function" and gethui() or coreGui
+    local interface = root:FindFirstChild("Luna UI")
+    if not interface then
+        local robloxGui = coreGui:FindFirstChild("RobloxGui")
+        interface = robloxGui and robloxGui:FindFirstChild("Luna UI")
+    end
+    local windowFrame = interface and interface:FindFirstChild("SmartWindow")
+    if not windowFrame then return end
+
+    local plum = Color3.fromRGB(37, 24, 54)
+    local deepPlum = Color3.fromRGB(25, 17, 39)
+    local lavender = Color3.fromRGB(190, 157, 255)
+    local coral = Color3.fromRGB(255, 149, 133)
+    local accents = ColorSequence.new(lavender, coral)
+
+    windowFrame.BackgroundColor3 = plum
+    windowFrame.Elements.BackgroundColor3 = deepPlum
+    windowFrame.Title.Title.TextColor3 = Color3.fromRGB(255, 239, 250)
+    windowFrame.Title.subtitle.TextColor3 = lavender
+    for _, line in ipairs({windowFrame.Line, windowFrame.Navigation.Line}) do
+        line.BackgroundColor3 = Color3.new(1, 1, 1)
+        local gradient = line:FindFirstChildOfClass("UIGradient") or Instance.new("UIGradient")
+        gradient.Color = accents
+        gradient.Parent = line
+    end
+    for _, tabButton in ipairs(windowFrame.Navigation.Tabs:GetChildren()) do
+        if tabButton:IsA("Frame") and tabButton.Name ~= "InActive Template" then
+            tabButton.BackgroundColor3 = Color3.fromRGB(104, 69, 153)
+        end
+    end
+
+    local pages = windowFrame.Elements.Interactions
+    for _, action in ipairs({
+        {pages["House Cloner"]["Place house"], coral, Color3.fromRGB(109, 49, 62)},
+        {pages["File System"]["Save house to file"], lavender, Color3.fromRGB(75, 49, 116)},
+    }) do
+        local row = action[1]
+        row.BackgroundColor3 = action[3]
+        row.Title.TextColor3 = action[2]
+        row.UIStroke.Color = action[2]
+    end
+end
+local styled, styleError = pcall(applyMariPalette)
+if not styled then warn("[Mari Hub] Theme: " .. tostring(styleError)) end
+local oldPanel = playerGui:FindFirstChild("HouseLayoutExporter")
+if oldPanel then oldPanel:Destroy() end
+environment.HouseExporterCleanup = function()
+    playerAdded:Disconnect()
+    playerRemoving:Disconnect()
+    task.cancel(placementWorker)
+    Luna:Destroy()
+end
