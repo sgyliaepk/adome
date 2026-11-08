@@ -195,15 +195,37 @@ local function placeHouse()
                 "No Bucks price for " .. id)
             total += bucks
         end
+        local blocked = {}
         for _, item in pairs(sourceHouse.furniture) do
             local entry = placementEntry(item.id)
-            assert(entry, "This save contains an item the catalog cannot sell: " .. tostring(item.id) .. ". No purchases were made.")
-            assert(typeof(item.cframe) == "CFrame", "Invalid saved position for " .. tostring(item.id))
-            addPrice(entry, item.id)
+            if not entry then
+                local original = catalog[item.id]
+                local reason = original and original.buy_behavior and "requires the in-game purchase flow" or "unavailable for batch placement"
+                blocked[tostring(item.id)] = reason
+                continue
+            end
+            local bucks, alternate = prices.get_cost(entry)
+            if type(bucks) ~= "number" or bucks < 0 or alternate then
+                blocked[tostring(item.id)] = "no Bucks price"
+                continue
+            end
+            if typeof(item.cframe) ~= "CFrame" then
+                blocked[tostring(item.id)] = "invalid saved position"
+                continue
+            end
+            total += bucks
             table.insert(requests, {
                 kind = entry.kind,
                 properties = {cframe = item.cframe, scale = item.scale, colors = item.colors},
             })
+        end
+        if next(blocked) then
+            local issues = {}
+            for id, reason in pairs(blocked) do
+                table.insert(issues, id .. " (" .. reason .. ")")
+            end
+            table.sort(issues)
+            error("Furniture blocked before purchase: " .. table.concat(issues, ", ") .. ".", 0)
         end
         assert(not target.max_furniture or #requests <= target.max_furniture, "The destination furniture limit is too low.")
         for roomId, room in pairs(sourceHouse.textures or {}) do
