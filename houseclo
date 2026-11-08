@@ -122,7 +122,8 @@ tab:CreateButton({
     end,
 })
 tab:CreateButton({
-    Name = "Sell All Furnitures",
+    Name = "Clear house",
+    Description = "Sells furniture at the game resale value. Wallpaper and flooring stay in place.",
     Callback = function()
         local ok, problem = pcall(function()
             local houseClient = loadModule("HouseClient")
@@ -145,7 +146,7 @@ tab:CreateButton({
             assert(#selection > 0, "Open the furniture editor before selling.")
             editor:remove_all_furniture(selection)
         end)
-        if not ok then notify("Cannot open bulk sell", tostring(problem)) end
+        if not ok then notify("Could not clear furniture", tostring(problem)) end
     end,
 })
 local placementStatus = tab:CreateParagraph({Title = "Placement status", Text = "Load a house file to begin."})
