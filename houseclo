@@ -156,6 +156,23 @@ local prices = loadModule("new:FurnitureEntryHelper")
 local money = loadModule("ClientData")
 local router = loadModule("RouterClient")
 local placementRequested = false
+local function canBuyFurniture(entry)
+    return entry and entry.can_use_in_house and not entry.off_sale and not entry.gamepass and not entry.buy_behavior
+end
+
+local function placementEntry(id)
+    local entry = catalog[id]
+    if canBuyFurniture(entry) then return entry end
+    if type(id) ~= "string" or not entry or not entry.model_name then return nil end
+
+    -- Some tutorial items have a normal catalog version of the same model.
+    local baseId = id:match("^(.+)_tutorial$")
+    local replacement = baseId and catalog[baseId]
+    if canBuyFurniture(replacement) and replacement.model_name == entry.model_name then
+        return replacement
+    end
+    return nil
+end
 local function placeHouse()
     if placing then return end
     placing = true
@@ -179,10 +196,9 @@ local function placeHouse()
             total += bucks
         end
         for _, item in pairs(sourceHouse.furniture) do
-            local entry = catalog[item.id]
-            assert(entry and entry.can_use_in_house and not entry.off_sale and not entry.gamepass
-                and not entry.buy_behavior and typeof(item.cframe) == "CFrame",
-                "Cannot purchase or place " .. tostring(item.id))
+            local entry = placementEntry(item.id)
+            assert(entry, "This save contains an item the catalog cannot sell: " .. tostring(item.id) .. ". No purchases were made.")
+            assert(typeof(item.cframe) == "CFrame", "Invalid saved position for " .. tostring(item.id))
             addPrice(entry, item.id)
             table.insert(requests, {
                 kind = entry.kind,
